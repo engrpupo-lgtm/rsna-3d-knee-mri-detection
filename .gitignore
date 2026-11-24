@@ -221,3 +221,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# macOS & ML Artifacts
+.DS_Store
+*.pth
+*.pt
+*.npy
+*.npz
+*.dcm
+data/
+checkpoints/
