@@ -6,6 +6,25 @@ import torch.nn as nn
 import torchvision.models as models
 
 
+class SliceAttentionGate(nn.Module):
+    """Channel-wise Squeeze-and-Excitation gate across the 2.5D slice stack."""
+
+    def __init__(self, num_slices: int = 5) -> None:
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(num_slices, num_slices * 2),
+            nn.SiLU(),
+            nn.Linear(num_slices * 2, num_slices),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights = self.gate(x).unsqueeze(-1).unsqueeze(-1)
+        return x * weights
+
+
 def build_25d_efficientnet_b0(
     in_channels: int = 5, weights_path: Optional[str] = None
 ) -> nn.Sequential:
@@ -36,8 +55,22 @@ def build_25d_efficientnet_b0(
     return nn.Sequential(backbone.features, backbone.avgpool, nn.Flatten())
 
 
+class CrossPlaneGatedFusion(nn.Module):
+    """Bidirectional cross-plane attention gate between Sagittal and Coronal embeddings."""
+
+    def __init__(self, feat_dim: int = 1280) -> None:
+        super().__init__()
+        self.sag_to_cor = nn.Sequential(nn.Linear(feat_dim, feat_dim), nn.Sigmoid())
+        self.cor_to_sag = nn.Sequential(nn.Linear(feat_dim, feat_dim), nn.Sigmoid())
+
+    def forward(self, feat_sag: torch.Tensor, feat_cor: torch.Tensor) -> torch.Tensor:
+        gated_sag = feat_sag * self.cor_to_sag(feat_cor)
+        gated_cor = feat_cor * self.sag_to_cor(feat_sag)
+        return torch.cat([feat_sag + gated_sag, feat_cor + gated_cor], dim=1)
+
+
 class DualBranchKneeNet(nn.Module):
-    """Late-fusion dual-plane (Sagittal + Coronal) 2.5D CNN for 12 knee pathologies."""
+    """Slice-attended dual-plane (Sagittal + Coronal) 2.5D CNN with cross-plane gated fusion."""
 
     def __init__(
         self,
@@ -46,8 +79,12 @@ class DualBranchKneeNet(nn.Module):
         weights_path: Optional[str] = None,
     ) -> None:
         super().__init__()
+        self.sag_slice_attn = SliceAttentionGate(in_channels)
+        self.cor_slice_attn = SliceAttentionGate(in_channels)
+
         self.sag_branch = build_25d_efficientnet_b0(in_channels, weights_path)
         self.cor_branch = build_25d_efficientnet_b0(in_channels, weights_path)
+        self.fusion = CrossPlaneGatedFusion(feat_dim=1280)
 
         self.classifier = nn.Sequential(
             nn.Dropout(p=0.3),
@@ -59,7 +96,7 @@ class DualBranchKneeNet(nn.Module):
         )
 
     def forward(self, sag: torch.Tensor, cor: torch.Tensor) -> torch.Tensor:
-        feat_sag = self.sag_branch(sag)
-        feat_cor = self.cor_branch(cor)
-        fused = torch.cat([feat_sag, feat_cor], dim=1)
+        feat_sag = self.sag_branch(self.sag_slice_attn(sag))
+        feat_cor = self.cor_branch(self.cor_slice_attn(cor))
+        fused = self.fusion(feat_sag, feat_cor)
         return self.classifier(fused)
